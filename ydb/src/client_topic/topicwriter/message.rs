@@ -2,7 +2,7 @@ use crate::{errors, YdbResult};
 use derive_builder::Builder;
 use std::time;
 
-#[derive(Builder)]
+#[derive(Builder, Debug)]
 #[builder(build_fn(error = "errors::YdbError", validate = "Self::validate"))]
 #[allow(dead_code)]
 pub struct TopicWriterMessage {

@@ -1,17 +1,19 @@
 use crate::client_common::TokenCache;
+use crate::client_topic::compression::DecompressionWorker;
 use crate::client_topic::topicreader::cancelation_token::YdbCancellationToken;
 use crate::client_topic::topicreader::messages::TopicReaderBatch;
 use crate::client_topic::topicreader::partition_state::PartitionSession;
+use crate::client_topic::topicreader::reader_options::TopicReaderOptions;
 use crate::grpc_connection_manager::GrpcConnectionManager;
 use crate::grpc_wrapper::grpc_stream_wrapper::AsyncGrpcStreamWrapper;
 use crate::grpc_wrapper::raw_topic_service::client::RawTopicClient;
 use crate::grpc_wrapper::raw_topic_service::common::partition::RawOffsetsRange;
 use crate::grpc_wrapper::raw_topic_service::common::update_token::RawUpdateTokenRequest;
 use crate::grpc_wrapper::raw_topic_service::stream_read::messages::{
-    PartitionCommitOffset, RawCommitOffsetRequest, RawFromClientOneOf, RawFromServer,
-    RawInitRequest, RawReadRequest, RawReadResponse, RawStartPartitionSessionRequest,
-    RawStartPartitionSessionResponse, RawStopPartitionSessionRequest,
-    RawStopPartitionSessionResponse, RawTopicReadSettings,
+    PartitionCommitOffset, RawBatchWithId, RawCommitOffsetRequest, RawFromClientOneOf,
+    RawFromServer, RawInitRequest, RawReadRequest, RawReadResponse,
+    RawStartPartitionSessionRequest, RawStartPartitionSessionResponse,
+    RawStopPartitionSessionRequest, RawStopPartitionSessionResponse, RawTopicReadSettings,
 };
 use crate::grpc_wrapper::raw_topic_service::update_offsets_in_transaction::{
     RawPartitionOffsets, RawTopicOffsets, RawTransactionIdentity,
@@ -22,24 +24,32 @@ use crate::transaction::{Transaction, TransactionInfo};
 use crate::{YdbError, YdbResult};
 use secrecy::ExposeSecret;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::select;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
 use ydb_grpc::ydb_proto::topic::stream_read_message::{FromClient, FromServer};
 
+struct StreamLoopContext {
+    partition_sessions: Arc<Mutex<HashMap<i64, PartitionSession>>>,
+    decompression_worker: DecompressionWorker,
+}
+
 pub struct TopicReader {
-    stream: AsyncGrpcStreamWrapper<FromClient, FromServer>,
-    last_read_response: Option<RawReadResponse>,
+    stream_sender: UnboundedSender<FromClient>,
     last_error: Option<YdbError>,
     stop_backgroung_work_token: YdbCancellationToken,
 
-    partition_sessions: HashMap<i64, PartitionSession>,
+    partition_sessions: Arc<Mutex<HashMap<i64, PartitionSession>>>,
 
     // Added for transaction support
     topic_service: RawTopicClient,
     consumer: String,
+
+    decompression_receiver: mpsc::UnboundedReceiver<YdbResult<RawBatchWithId>>,
 }
 
 const READER_BUFFER_SIZE: i64 = 1024 * 1024; // 1MB
@@ -62,12 +72,18 @@ impl TopicReader {
 
     async fn read_batch_private(&mut self) -> YdbResult<TopicReaderBatch> {
         loop {
-            if let Some(batch) = self.cut_batch() {
-                return Ok(batch);
+            if let Some(err) = &self.last_error {
+                return Err(err.clone());
             }
 
-            let resp = self.stream.receive::<RawFromServer>().await?;
-            self.process_incoming_message(resp)?
+            let batch = self
+                .decompression_receiver
+                .recv()
+                .await
+                .ok_or_else(|| YdbError::custom("decompression worker closed"))??;
+            if let Some(result) = self.cut_batch(batch) {
+                return Ok(result);
+            }
         }
     }
 
@@ -141,9 +157,9 @@ impl TopicReader {
     // add commit to internal buffer. Success return isn't guarantee that the message
     // committed to server. Real commit is background process.
     pub fn commit(&mut self, commit_marker: TopicReaderCommitMarker) -> YdbResult<()> {
-        self.stream
-            .send_nowait(RawFromClientOneOf::CommitOffsetRequest(
-                RawCommitOffsetRequest {
+        self.stream_sender
+            .send(
+                RawFromClientOneOf::CommitOffsetRequest(RawCommitOffsetRequest {
                     commit_offsets: vec![PartitionCommitOffset {
                         partition_session_id: commit_marker.partition_session_id,
                         offsets: vec![RawOffsetsRange {
@@ -151,8 +167,10 @@ impl TopicReader {
                             end: commit_marker.end_offset,
                         }],
                     }],
-                },
-            ))?;
+                })
+                .into(),
+            )
+            .map_err(|e| YdbError::custom(format!("failed to send CommitOffset request: {e}")))?;
 
         Ok(())
     }
@@ -160,6 +178,7 @@ impl TopicReader {
     pub(crate) async fn new(
         consumer: String,
         selectors: TopicSelectors,
+        options: TopicReaderOptions,
         connection_manager: GrpcConnectionManager,
         token_cache: TokenCache,
     ) -> YdbResult<Self> {
@@ -195,39 +214,39 @@ impl TopicReader {
             .get_auth_service(RawTopicClient::new)
             .await?;
 
-        Ok(Self {
+        let (decompression_worker, decompression_receiver) =
+            DecompressionWorker::new(options.codec_registry, options.compression_error_strategy);
+
+        let partition_sessions = Arc::new(Mutex::new(HashMap::new()));
+        let stream_sender = stream.clone_sender();
+
+        tokio::spawn(Self::stream_loop(
             stream,
-            last_read_response: None,
+            partition_sessions.clone(),
+            decompression_worker,
+            stop_backgroung_work_token.clone(),
+        ));
+
+        Ok(Self {
+            stream_sender,
             last_error: None,
             stop_backgroung_work_token,
-            partition_sessions: HashMap::new(),
+            partition_sessions,
             topic_service: transaction_topic_service,
             consumer,
+            decompression_receiver,
         })
     }
 
-    fn cut_batch(&mut self) -> Option<TopicReaderBatch> {
-        let last_read_response = if let Some(last_read_response) = &mut self.last_read_response {
-            last_read_response
-        } else {
+    fn cut_batch(&mut self, batch_with_id: RawBatchWithId) -> Option<TopicReaderBatch> {
+        let partition_session_id = batch_with_id.partition_session_id;
+        let batch = batch_with_id.batch;
+
+        if batch.message_data.is_empty() {
             return None;
-        };
-
-        let last_partition_data = last_read_response.partition_data.last_mut()?;
-
-        let partition_session_id = last_partition_data.partition_session_id;
-        let last_batch = if let Some(batch) = last_partition_data.batches.pop_front() {
-            batch
-        } else {
-            last_read_response.partition_data.pop();
-            return self.cut_batch();
-        };
-
-        if last_batch.message_data.is_empty() {
-            return self.cut_batch();
         }
 
-        let size = last_batch.get_read_session_size();
+        let size = batch.get_read_session_size();
         if size > 0 {
             if let Err(err) = self.send_read_request(size) {
                 error!("error while send read request: {}", err);
@@ -236,44 +255,82 @@ impl TopicReader {
             }
         }
 
-        let partition_session = if let Some(partition_session) =
-            self.partition_sessions.get_mut(&partition_session_id)
-        {
-            partition_session
-        } else {
-            error!(
-                "Receive message without active partition, partition_session_id: {}",
-                partition_session_id
-            );
-            return self.cut_batch();
-        };
-
-        Some(TopicReaderBatch::new(last_batch, partition_session))
+        let mut sessions = self.partition_sessions.lock().unwrap();
+        match sessions.get_mut(&partition_session_id) {
+            Some(partition_session) => Some(TopicReaderBatch::new(batch, partition_session)),
+            None => {
+                error!(
+                    "Receive message without active partition, partition_session_id: {}",
+                    partition_session_id
+                );
+                None
+            }
+        }
     }
 
     fn send_read_request(&mut self, size: i64) -> YdbResult<()> {
-        self.stream
-            .send_nowait(RawFromClientOneOf::ReadRequest(RawReadRequest {
-                bytes_size: size,
-            }))?;
+        self.stream_sender
+            .send(RawFromClientOneOf::ReadRequest(RawReadRequest { bytes_size: size }).into())
+            .map_err(|e| YdbError::custom(format!("failed to send Read request: {e}")))?;
         Ok(())
     }
 
-    fn process_incoming_message(&mut self, message: RawFromServer) -> YdbResult<()> {
+    async fn stream_loop(
+        mut stream: AsyncGrpcStreamWrapper<FromClient, FromServer>,
+        partition_sessions: Arc<Mutex<HashMap<i64, PartitionSession>>>,
+        decompression_worker: DecompressionWorker,
+        cancellation_token: YdbCancellationToken,
+    ) {
+        let context = StreamLoopContext {
+            partition_sessions,
+            decompression_worker,
+        };
+
+        let tokio_cancellation = cancellation_token.to_tokio_token();
+
+        loop {
+            let maybe_message = select! {
+                _ = tokio_cancellation.cancelled() => {
+                    debug!("stream_loop cancelled, stopping");
+                    break;
+                }
+                message = stream.receive::<RawFromServer>() => message,
+            };
+
+            match maybe_message {
+                Ok(message) => {
+                    if let Err(err) = Self::process_incoming_message(&context, &mut stream, message)
+                    {
+                        error!("topic reader stream loop failed to process message: {err}");
+                        break;
+                    }
+                }
+                Err(err) => {
+                    error!("topic reader stream loop failed: {err}");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn process_incoming_message(
+        context: &StreamLoopContext,
+        stream: &mut AsyncGrpcStreamWrapper<FromClient, FromServer>,
+        message: RawFromServer,
+    ) -> YdbResult<()> {
         match message {
-            RawFromServer::ReadResponse(read_resopnse) => {
-                self.process_read_response(read_resopnse)?
+            RawFromServer::ReadResponse(read_response) => {
+                Self::process_read_response(context, read_response)?
             }
             RawFromServer::InitResponse(resp) => {
                 info!("init response for topic reader: {:?}", resp)
             }
-            RawFromServer::UpdateTokenResponse(_) => { /*pass*/ }
-
-            RawFromServer::StartPartitionSessionRequest(start_partition_request) => {
-                self.process_start_partition_session_request(start_partition_request)?
+            RawFromServer::UpdateTokenResponse(_) => { /* pass */ }
+            RawFromServer::StartPartitionSessionRequest(request) => {
+                Self::process_start_partition_session_request(context, stream, request)?;
             }
-            RawFromServer::StopPartitionSessionRequest(stop_partition_request) => {
-                self.process_stop_partition_session_request(stop_partition_request)?
+            RawFromServer::StopPartitionSessionRequest(request) => {
+                Self::process_stop_partition_session_request(context, stream, request)?;
             }
             RawFromServer::UnsupportedMessage(mess) => {
                 debug!("topic readed recived unsupported message: {}", mess)
@@ -283,17 +340,28 @@ impl TopicReader {
         Ok(())
     }
 
-    fn process_read_response(&mut self, read_response: RawReadResponse) -> YdbResult<()> {
-        self.last_read_response = Some(read_response);
+    fn process_read_response(
+        context: &StreamLoopContext,
+        read_response: RawReadResponse,
+    ) -> YdbResult<()> {
+        for partition in read_response.partition_data {
+            for batch in partition.batches {
+                context.decompression_worker.process_batch(RawBatchWithId {
+                    partition_session_id: partition.partition_session_id,
+                    batch,
+                })?;
+            }
+        }
 
         Ok(())
     }
 
     fn process_start_partition_session_request(
-        &mut self,
+        context: &StreamLoopContext,
+        stream: &mut AsyncGrpcStreamWrapper<FromClient, FromServer>,
         request: RawStartPartitionSessionRequest,
     ) -> YdbResult<()> {
-        self.partition_sessions.insert(
+        context.partition_sessions.lock().unwrap().insert(
             request.partition_session.partition_session_id,
             PartitionSession {
                 partition_session_id: request.partition_session.partition_session_id,
@@ -303,29 +371,31 @@ impl TopicReader {
             },
         );
 
-        self.stream
-            .send_nowait(RawFromClientOneOf::StartPartitionSessionResponse(
-                RawStartPartitionSessionResponse {
-                    partition_session_id: request.partition_session.partition_session_id,
-                },
-            ))?;
+        stream.send_nowait(RawFromClientOneOf::StartPartitionSessionResponse(
+            RawStartPartitionSessionResponse {
+                partition_session_id: request.partition_session.partition_session_id,
+            },
+        ))?;
 
         Ok(())
     }
 
     fn process_stop_partition_session_request(
-        &mut self,
+        context: &StreamLoopContext,
+        stream: &mut AsyncGrpcStreamWrapper<FromClient, FromServer>,
         request: RawStopPartitionSessionRequest,
     ) -> YdbResult<()> {
-        self.partition_sessions
+        context
+            .partition_sessions
+            .lock()
+            .unwrap()
             .remove(&request.partition_session_id);
 
-        self.stream
-            .send_nowait(RawFromClientOneOf::StopPartitionSessionResponse(
-                RawStopPartitionSessionResponse {
-                    partition_session_id: request.partition_session_id,
-                },
-            ))?;
+        stream.send_nowait(RawFromClientOneOf::StopPartitionSessionResponse(
+            RawStopPartitionSessionResponse {
+                partition_session_id: request.partition_session_id,
+            },
+        ))?;
 
         Ok(())
     }
