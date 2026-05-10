@@ -520,7 +520,6 @@ async fn write_and_read_with_gzip_codec_roundtrip() -> YdbResult<()> {
             TopicWriterOptionsBuilder::default()
                 .topic_path(topic_path.clone())
                 .codec(Codec::GZIP)
-                .auto_seq_no(false)
                 .build()?,
         )
         .await?;
@@ -529,7 +528,6 @@ async fn write_and_read_with_gzip_codec_roundtrip() -> YdbResult<()> {
     writer
         .write_with_ack(
             TopicWriterMessageBuilder::default()
-                .seq_no(Some(1))
                 .data(expected.clone())
                 .build()?,
         )

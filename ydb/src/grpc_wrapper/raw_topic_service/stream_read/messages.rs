@@ -275,6 +275,13 @@ pub(crate) struct RawBatchWithId {
 }
 
 #[derive(Debug)]
+pub(crate) struct DecompressedBatch {
+    pub partition_session_id: i64,
+    pub batch: RawBatch,
+    pub read_session_size_bytes: i64,
+}
+
+#[derive(Debug)]
 pub(crate) struct RawMessageData {
     pub offset: i64,
     pub seq_no: i64,

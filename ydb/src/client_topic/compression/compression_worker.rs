@@ -7,6 +7,7 @@ use crate::YdbResult;
 use prost::bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::warn;
 
 pub struct CompressionWorker {
     codec: Option<Codec>,
@@ -36,14 +37,14 @@ impl CompressionWorker {
         )
     }
 
-    pub fn process_batch(&self, batch: Vec<TopicWriterMessage>) -> YdbResult<()> {
+    pub async fn process_batch(&self, batch: Vec<TopicWriterMessage>) -> YdbResult<()> {
         let registry = self.codec_registry.clone();
         let strategy = self.error_strategy.clone();
         let codec = self.codec.clone();
 
         self.queue.submit(Box::new(move || {
             compress_batch(batch, &registry, &codec, &strategy)
-        }))
+        })).await
     }
 }
 
@@ -59,11 +60,22 @@ fn compress_batch(
     };
 
     for message in batch.iter_mut() {
-        match registry.compress(Bytes::from(message.data.clone()), codec) {
-            Ok(compressed) => message.data = compressed.to_vec(),
+        message.uncompressed_size.get_or_insert(message.data.len() as i64);
+
+        let data_bytes = Bytes::from(std::mem::take(&mut message.data));
+        match registry.compress(&data_bytes, codec) {
+            Ok(compressed) => {
+                message.data = compressed.to_vec();
+                message.codec = Some(codec.clone());
+            }
             Err(err) => match strategy {
-                ErrorHandlingStrategy::FailFast => return Err(err),
-                ErrorHandlingStrategy::Skip => {}
+                ErrorHandlingStrategy::FailFast => {
+                    return Err(err);
+                }
+                ErrorHandlingStrategy::Skip => {
+                    warn!("compression failed for message (seq_no: {:?}), sending as RAW: {}", message.seq_no, err);
+                    message.data = data_bytes.to_vec();
+                }
             },
         }
     }

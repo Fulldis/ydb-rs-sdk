@@ -10,8 +10,8 @@ use crate::grpc_wrapper::raw_topic_service::client::RawTopicClient;
 use crate::grpc_wrapper::raw_topic_service::common::partition::RawOffsetsRange;
 use crate::grpc_wrapper::raw_topic_service::common::update_token::RawUpdateTokenRequest;
 use crate::grpc_wrapper::raw_topic_service::stream_read::messages::{
-    PartitionCommitOffset, RawBatchWithId, RawCommitOffsetRequest, RawFromClientOneOf,
-    RawFromServer, RawInitRequest, RawReadRequest, RawReadResponse,
+    DecompressedBatch, PartitionCommitOffset, RawBatchWithId, RawCommitOffsetRequest,
+    RawFromClientOneOf, RawFromServer, RawInitRequest, RawReadRequest, RawReadResponse,
     RawStartPartitionSessionRequest, RawStartPartitionSessionResponse,
     RawStopPartitionSessionRequest, RawStopPartitionSessionResponse, RawTopicReadSettings,
 };
@@ -24,7 +24,7 @@ use crate::transaction::{Transaction, TransactionInfo};
 use crate::{YdbError, YdbResult};
 use secrecy::ExposeSecret;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::select;
@@ -36,11 +36,12 @@ use ydb_grpc::ydb_proto::topic::stream_read_message::{FromClient, FromServer};
 struct StreamLoopContext {
     partition_sessions: Arc<Mutex<HashMap<i64, PartitionSession>>>,
     decompression_worker: DecompressionWorker,
+    last_error: Arc<RwLock<Option<YdbError>>>,
 }
 
 pub struct TopicReader {
     stream_sender: UnboundedSender<FromClient>,
-    last_error: Option<YdbError>,
+    last_error: Arc<RwLock<Option<YdbError>>>,
     stop_backgroung_work_token: YdbCancellationToken,
 
     partition_sessions: Arc<Mutex<HashMap<i64, PartitionSession>>>,
@@ -49,22 +50,33 @@ pub struct TopicReader {
     topic_service: RawTopicClient,
     consumer: String,
 
-    decompression_receiver: mpsc::UnboundedReceiver<YdbResult<RawBatchWithId>>,
+    decompression_receiver: mpsc::UnboundedReceiver<YdbResult<DecompressedBatch>>,
 }
 
 const READER_BUFFER_SIZE: i64 = 1024 * 1024; // 1MB
 const UPDATE_TOKEN_INTERVAL: time::Duration = Duration::from_secs(3600);
 
+fn get_last_error(last_error: &RwLock<Option<YdbError>>) -> Option<YdbError> {
+    last_error.read().unwrap().clone()
+}
+
+fn set_last_error(last_error: &RwLock<Option<YdbError>>, err: YdbError) {
+    let mut guard = last_error.write().unwrap();
+    if guard.is_none() {
+        *guard = Some(err);
+    }
+}
+
 impl TopicReader {
     pub async fn read_batch(&mut self) -> YdbResult<TopicReaderBatch> {
-        if let Some(err) = &self.last_error {
-            return Err(err.clone());
+        if let Some(err) = get_last_error(&self.last_error) {
+            return Err(err);
         }
 
         match self.read_batch_private().await {
             Ok(batch) => Ok(batch),
             Err(err) => {
-                self.last_error.get_or_insert(err.clone());
+                set_last_error(&self.last_error, err.clone());
                 Err(err)
             }
         }
@@ -72,15 +84,18 @@ impl TopicReader {
 
     async fn read_batch_private(&mut self) -> YdbResult<TopicReaderBatch> {
         loop {
-            if let Some(err) = &self.last_error {
-                return Err(err.clone());
+            if let Some(err) = get_last_error(&self.last_error) {
+                return Err(err);
             }
 
             let batch = self
                 .decompression_receiver
                 .recv()
                 .await
-                .ok_or_else(|| YdbError::custom("decompression worker closed"))??;
+                .ok_or_else(|| {
+                    get_last_error(&self.last_error)
+                        .unwrap_or_else(|| YdbError::custom("decompression worker closed"))
+                })??;
             if let Some(result) = self.cut_batch(batch) {
                 return Ok(result);
             }
@@ -218,18 +233,20 @@ impl TopicReader {
             DecompressionWorker::new(options.codec_registry, options.compression_error_strategy);
 
         let partition_sessions = Arc::new(Mutex::new(HashMap::new()));
+        let last_error: Arc<RwLock<Option<YdbError>>> = Arc::new(RwLock::new(None));
         let stream_sender = stream.clone_sender();
 
         tokio::spawn(Self::stream_loop(
             stream,
             partition_sessions.clone(),
             decompression_worker,
+            last_error.clone(),
             stop_backgroung_work_token.clone(),
         ));
 
         Ok(Self {
             stream_sender,
-            last_error: None,
+            last_error,
             stop_backgroung_work_token,
             partition_sessions,
             topic_service: transaction_topic_service,
@@ -238,21 +255,21 @@ impl TopicReader {
         })
     }
 
-    fn cut_batch(&mut self, batch_with_id: RawBatchWithId) -> Option<TopicReaderBatch> {
-        let partition_session_id = batch_with_id.partition_session_id;
-        let batch = batch_with_id.batch;
+    fn cut_batch(&mut self, decompressed: DecompressedBatch) -> Option<TopicReaderBatch> {
+        let partition_session_id = decompressed.partition_session_id;
+        let batch = decompressed.batch;
+
+        // For skip strategy it is important to still request amount received
+        if decompressed.read_session_size_bytes > 0 {
+            if let Err(err) = self.send_read_request(decompressed.read_session_size_bytes) {
+                error!("error while send read request: {}", err);
+                set_last_error(&self.last_error, err);
+                return None;
+            }
+        }
 
         if batch.message_data.is_empty() {
             return None;
-        }
-
-        let size = batch.get_read_session_size();
-        if size > 0 {
-            if let Err(err) = self.send_read_request(size) {
-                error!("error while send read request: {}", err);
-                self.last_error.get_or_insert(err);
-                return None;
-            }
         }
 
         let mut sessions = self.partition_sessions.lock().unwrap();
@@ -279,11 +296,13 @@ impl TopicReader {
         mut stream: AsyncGrpcStreamWrapper<FromClient, FromServer>,
         partition_sessions: Arc<Mutex<HashMap<i64, PartitionSession>>>,
         decompression_worker: DecompressionWorker,
+        last_error: Arc<RwLock<Option<YdbError>>>,
         cancellation_token: YdbCancellationToken,
     ) {
         let context = StreamLoopContext {
             partition_sessions,
             decompression_worker,
+            last_error,
         };
 
         let tokio_cancellation = cancellation_token.to_tokio_token();
@@ -299,28 +318,33 @@ impl TopicReader {
 
             match maybe_message {
                 Ok(message) => {
-                    if let Err(err) = Self::process_incoming_message(&context, &mut stream, message)
+                    if let Err(err) = Self::process_incoming_message(&context, &mut stream, message).await
                     {
                         error!("topic reader stream loop failed to process message: {err}");
+                        set_last_error(&context.last_error, err);
                         break;
                     }
                 }
                 Err(err) => {
                     error!("topic reader stream loop failed: {err}");
+                    set_last_error(
+                        &context.last_error,
+                        YdbError::custom(format!("stream loop failed: {err}")),
+                    );
                     break;
                 }
             }
         }
     }
 
-    fn process_incoming_message(
+    async fn process_incoming_message(
         context: &StreamLoopContext,
         stream: &mut AsyncGrpcStreamWrapper<FromClient, FromServer>,
         message: RawFromServer,
     ) -> YdbResult<()> {
         match message {
             RawFromServer::ReadResponse(read_response) => {
-                Self::process_read_response(context, read_response)?
+                Self::process_read_response(context, read_response).await?
             }
             RawFromServer::InitResponse(resp) => {
                 info!("init response for topic reader: {:?}", resp)
@@ -332,15 +356,15 @@ impl TopicReader {
             RawFromServer::StopPartitionSessionRequest(request) => {
                 Self::process_stop_partition_session_request(context, stream, request)?;
             }
-            RawFromServer::UnsupportedMessage(mess) => {
-                debug!("topic readed recived unsupported message: {}", mess)
+            RawFromServer::UnsupportedMessage(message) => {
+                debug!("topic reader received unsupported message: {}", message)
             }
         }
 
         Ok(())
     }
 
-    fn process_read_response(
+    async fn process_read_response(
         context: &StreamLoopContext,
         read_response: RawReadResponse,
     ) -> YdbResult<()> {
@@ -349,7 +373,7 @@ impl TopicReader {
                 context.decompression_worker.process_batch(RawBatchWithId {
                     partition_session_id: partition.partition_session_id,
                     batch,
-                })?;
+                }).await?;
             }
         }
 

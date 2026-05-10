@@ -3,9 +3,10 @@ use crate::client_topic::list_types::Codec;
 use crate::{YdbError, YdbResult};
 use prost::bytes::Bytes;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-pub type EncoderFunc = fn(Bytes) -> YdbResult<Bytes>;
-pub type DecoderFunc = fn(Bytes) -> YdbResult<Bytes>;
+pub type EncoderFunc = Arc<dyn Fn(&Bytes) -> YdbResult<Bytes> + Send + Sync>;
+pub type DecoderFunc = Arc<dyn Fn(&Bytes) -> YdbResult<Bytes> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct CodecRegistry {
@@ -15,7 +16,10 @@ pub struct CodecRegistry {
 impl CodecRegistry {
     pub fn new() -> Self {
         let mut funcs: HashMap<Codec, (EncoderFunc, DecoderFunc)> = HashMap::new();
-        funcs.insert(Codec::GZIP, (gzip_compress, gzip_decompress));
+        funcs.insert(
+            Codec::GZIP,
+            (Arc::new(gzip_compress), Arc::new(gzip_decompress)),
+        );
         Self { funcs }
     }
 
@@ -49,11 +53,11 @@ impl CodecRegistry {
             .ok_or_else(|| YdbError::custom(format!("unsupported codec {:?}", codec)))
     }
 
-    pub fn compress(&self, data: Bytes, codec: &Codec) -> YdbResult<Bytes> {
+    pub fn compress(&self, data: &Bytes, codec: &Codec) -> YdbResult<Bytes> {
         self.get_codec(codec).and_then(|(encode, _)| encode(data))
     }
 
-    pub fn decompress(&self, data: Bytes, codec: &Codec) -> YdbResult<Bytes> {
+    pub fn decompress(&self, data: &Bytes, codec: &Codec) -> YdbResult<Bytes> {
         self.get_codec(codec).and_then(|(_, decode)| decode(data))
     }
 }

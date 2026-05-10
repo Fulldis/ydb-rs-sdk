@@ -32,7 +32,7 @@ pub struct TopicWriterOptions {
     #[builder(default = "Duration::from_secs(1)")]
     pub(crate) write_request_send_messages_period: Duration,
     #[builder(setter(strip_option), default)]
-    pub(crate) codec: Option<Codec>, // in case of no specified codec, codec is auto-selected
+    pub(crate) codec: Option<Codec>,
     #[builder(default = "default_codec_registry()")]
     pub(crate) codec_registry: Arc<CodecRegistry>,
     #[builder(default = "ErrorHandlingStrategy::FailFast")]
